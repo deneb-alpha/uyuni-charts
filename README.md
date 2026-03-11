@@ -75,35 +75,6 @@ spec:
         protocol: TCP
         hostPort: 4506
         containerPort: 4506
-      cobbler:
-        port: 25151
-        expose:
-          default:true
-        exposedPort: 25151
-        protocol: TCP
-        hostPort: 25151
-      node-xport:
-        port: 9101
-        expose:
-          default: true
-        exposedPort: 9101
-        protocol: TCP
-        hostPort: 9101
-      # Only if monitoring is enabled
-      db-xport:
-        port: 9187
-        expose:
-          default: true
-        exposedPort: 9187
-        protocol: TCP
-        hostPort: 9187
-      tasko-mtrx:
-        port: 9800
-        expose:
-          default: true
-        exposedPort: 9800
-        protocol: TCP
-        hostPort: 9800
       # Only if java debugging is enabled
       tasko-debug:
         port: 8001
