@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: 2026 SUSE LLC
+#
+# SPDX-License-Identifier: MIT
+
+name: Check website for releases
+
+on:
+  schedule:
+    - cron: '0 8 * * *' # Runs daily
+  workflow_dispatch:
+    inputs:
+      fallback_version:
+        description: 'Manual version for testing (e.g., 2026.03 or 5.2.0)'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Charts Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Fetch Version
+        id: fetch
+        env:
+          FALLBACK_INPUT: ${{ github.event.inputs.fallback_version }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ -n "$FALLBACK_INPUT" ]; then
+            echo "Using manual version: $FALLBACK_INPUT"
+            echo "version=$FALLBACK_INPUT" >> $GITHUB_OUTPUT
+
+          elif [ "$TARGET_BRANCH" == "main" ]; then
+            echo "Branch is main. Checking Uyuni website..."
+            HTML_CONTENT=$(curl -s https://raw.githubusercontent.com/uyuni-project/uyuni-project.github.io/master/index.html)
+            WEBSITE_VERSION=$(echo "$HTML_CONTENT" | grep -oP 'Get new \K[0-9]+(\.[0-9]+)+')
+
+            if [ -z "$WEBSITE_VERSION" ]; then
+              echo "❌ Could not find version on the Uyuni website."
+              exit 1
+            fi
+            echo "Website version is: $WEBSITE_VERSION"
+            echo "version=$WEBSITE_VERSION" >> $GITHUB_OUTPUT
+
+          elif [[ "$TARGET_BRANCH" == Manager-* ]]; then
+            MANAGER_VERSION="${TARGET_BRANCH#Manager-}"
+            echo "Branch is $TARGET_BRANCH. Checking SUSE Multi-Linux Manager $MANAGER_VERSION release notes..."
+
+            URL="https://www.suse.com/releasenotes/x86_64/multi-linux-manager/${MANAGER_VERSION}/index.html"
+            HTML_CONTENT=$(curl -s "$URL")
+
+            # Extracts the text inside <span style="display: none;" id="current_version">...</span>
+            WEBSITE_VERSION=$(echo "$HTML_CONTENT" | grep -oP '<span[^>]*id="current_version"[^>]*>\K[^<]+')
+
+            if [ -z "$WEBSITE_VERSION" ]; then
+              echo "❌ Could not find version on the Multi-Linux Manager website ($URL)."
+              exit 1
+            fi
+            echo "Website version is: $WEBSITE_VERSION"
+            echo "version=$WEBSITE_VERSION" >> $GITHUB_OUTPUT
+
+          else
+            echo "❌ Unknown branch pattern ($TARGET_BRANCH). Cannot determine which website to check."
+            exit 1
+          fi
+
+      - name: Apply Updates to Charts
+        env:
+          TARGET_DEPENDENCIES: "proxy-helm server-helm"
+          FETCHED_VERSION: ${{ steps.fetch.outputs.version }}
+        run: |
+          PRODUCT_VERSION="$FETCHED_VERSION"
+          # Remove leading zero from Uyuni release and add potentially missing micro part
+          # The regexp needs to convert versions like:
+          #    2025.02 to 2025.2.0
+          #    5.0.1.4 to 5.0.1_4
+          SEMANTIC_VERSION=$(echo "${PRODUCT_VERSION}" | sed -E -e 's/^([0-9]+)\.(0|0?[1-9][0-9]*)(\.([0-9]+))?\W?([^0-9][^.]+)?$/\1.\2.\4-\5/' -e 's/\.0([0-9]+)\./.\1./' -e 's/-\./_/' -e 's/\.-$/.0/' -e 's/\W+$//')
+
+          echo "Target Dependency Version: $SEMANTIC_VERSION"
+          read -r -a DEP_ARRAY <<< "$TARGET_DEPENDENCIES"
+
+          find . -name "Chart.yaml" | while read CHART_FILE; do
+            echo "Processing $CHART_FILE..."
+
+            # Update or add the appVersion
+            PRODUCT_VERSION="$PRODUCT_VERSION" yq -i '.appVersion = env(PRODUCT_VERSION)' "$CHART_FILE"
+
+            # Update dependencies
+            for DEP_NAME in "${DEP_ARRAY[@]}"; do
+              DEP_NAME="$DEP_NAME" SEMANTIC_VERSION="$SEMANTIC_VERSION" yq -i '(.dependencies[]? | select(.name == env(DEP_NAME)) | .version) = env(SEMANTIC_VERSION)' "$CHART_FILE"
+            done
+
+            # Increment the chart's own version
+            CURRENT_VERSION=$(yq '.version' "$CHART_FILE")
+            if [[ "$CURRENT_VERSION" =~ ^([0-9]+\.[0-9]+)\.([0-9]+)$ ]]; then
+              MAJOR_MINOR="${BASH_REMATCH[1]}"
+              PATCH="${BASH_REMATCH[2]}"
+              NEW_VERSION="${MAJOR_MINOR}.$((PATCH + 1))"
+              # Write bumped version
+              NEW_VERSION="$NEW_VERSION" yq -i '.version = env(NEW_VERSION)' "$CHART_FILE"
+            fi
+          done
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@c5b7803d3c26027c44e0ce2e626e2ac80dc0e6e7 # v6.0.5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Dynamically target the branch the workflow is currently running on
+          base: ${{ github.ref_name }}
+          branch: "update-charts-${{ github.ref_name }}-${{ steps.fetch.outputs.version }}"
+          commit-message: "chore: update chart versions to ${{ steps.fetch.outputs.version }}"
+          title: "[charts] Automatic update Charts versions to ${{ steps.fetch.outputs.version }}"
+          body: |
+            Automated PR from a new upstream release.
+
+            ⏳ **Status:** The registry check is currently polling in the background. Once registry publish finishes and the images are found, the CI check below will turn green, and this PR will be ready for manual review and merge.

@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: 2026 SUSE LLC
+#
+# SPDX-License-Identifier: MIT
+
+name: Registry Readiness Check
+
+on:
+  pull_request:
+    paths:
+      - '**/Chart.yaml'
+  workflow_dispatch:
+
+# Enforce Principle of Least Privilege
+permissions:
+  contents: read
+
+jobs:
+  verify-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Skopeo
+        # For immutable builds, consider pinning the apt package version in the future (e.g., skopeo=1.14.4-1~ubuntu22.04.1)
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: Determine Registry Target
+        id: config
+        # Pass GitHub context via env to prevent shell injection vulnerabilities
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          CHART_VERSION=$(find . -name "Chart.yaml" -print -quit | xargs yq '.version')
+          TARGET_BRANCH="$BASE_REF"
+
+          if [ "$TARGET_BRANCH" == "main" ]; then
+            REGISTRY_BASE="registry.opensuse.org/systemsmanagement/uyuni/master/charts"
+          elif [[ "$TARGET_BRANCH" == Manager-* ]]; then
+            MANAGER_VERSION="${TARGET_BRANCH#Manager-}"
+            REGISTRY_BASE="registry.suse.com/suse/multi-linux-manager/${MANAGER_VERSION}"
+          else
+            echo "❌ Unknown branch pattern."
+            exit 1
+          fi
+
+          echo "registry_base=$REGISTRY_BASE" >> $GITHUB_OUTPUT
+          echo "chart_version=$CHART_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if charts are published
+        env:
+          REGISTRY_BASE: ${{ steps.config.outputs.registry_base }}
+          CHART_VERSION: ${{ steps.config.outputs.chart_version }}
+        run: |
+          CHARTS=("server-helm" "proxy-helm")
+          MAX_RETRIES=3
+          RETRY_INTERVAL=10
+
+          echo "Checking registry for the target charts..."
+
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            echo "Attempt $i of $MAX_RETRIES..."
+            ALL_FOUND=true
+
+            for CHART in "${CHARTS[@]}"; do
+              TARGET_ARTIFACT="${REGISTRY_BASE}/${CHART}:${CHART_VERSION}"
+              if skopeo inspect "docker://${TARGET_ARTIFACT}" > /dev/null 2>&1; then
+                echo "  ✅ $CHART is available!"
+              else
+                echo "  ❌ $CHART is missing."
+                ALL_FOUND=false
+              fi
+            done
+
+            if [ "$ALL_FOUND" = true ]; then
+              echo "🎉 All required charts are available! PR is ready to merge."
+              exit 0
+            fi
+
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "⏳ Not all charts found yet. Waiting 10 seconds before the next attempt..."
+              sleep $RETRY_INTERVAL
+            fi
+          done
+
+          # If it exits the loop, it means it failed all 3 attempts
+          echo "::error::The images are still unpublished after 3 attempts. Please wait a moment for the publishing process to complete and manually re-run this failed workflow from the GitHub Actions UI."
+          exit 1
